@@ -186,6 +186,68 @@ def largest_table(html:str) ->pd.DataFrame:
     return df
 
 
+#==================LLM ACCESS=====================================
+
+_llm_cache: dict[str, Any]= {}
+
+def get_llm(model:str):
+    if model not in _llm_cache:
+        key=os.getenv("GOOGLE_API_KEY")
+        if not key:
+            raise RuntimeError("GOOGLE_API_KEY is not set")
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        _llm_cache[model]=ChatGoogleGenerativeAI(model=model,temperature=0,google_api_key=key)
+    return _llm_cache[model]
+
+
+def _text(resp)->str:
+    c=resp.content
+    if isinstance(c, list):
+        return "".join(p.get("text","") if isinstance(p, dict) else str(p) for p in c)
+    return str(c or "")
+
+
+def call_llm(messages: list,model: str=MODEL, retries: int =2) -> str:
+    for i in range(retries+1):
+        try:
+            return _text(get_llm(model).invoke(messages))
+        except RuntimeError:
+            raise
+        except Exception as e:
+            if i == retries:
+                raise
+            log.warning("LLM call failed (%s); retry %d", e,i+1)
+            time.sleep(2 ** i)
+
+def extract_json(s:str) -> dict:
+    s=re.sub(r"^```(?:json)?\s*|\s*```$", "",(s or "").strip())
+    a, b=s.find("{"),s.rfind("}")
+    if a == -1 or b <=a :
+        raise ValueError("no JSON object found")
+    return json.loads(s[a:b +1])
+
+
+
+def extract_table_with_llm(content: bytes, mime: str) ->pd.DataFrame:
+    from langchain_core.messages import HumanMessage
+    media ={"type": "media", "mime_type": mime,"data":base64.b64encode(content).decode()}
+
+    ask=('Extract ALL tabular data as JSON only: {"columns":["c1",...],"rows":[[...],[...]]}. '
+         "Merge tables that share columns.Numbers must be numeric.No commentary.")
+
+    raw= call_llm([HumanMessage(content=[{"type": "text", "text":ask}, media])],VISION_MODEL)
+
+    try:
+        obj=extract_json(raw)
+        df=pd.DataFrame(obj.get("rows",[]),columns=obj.get("columns") or None )
+        if df.empty:
+            raise ValueError("empty table")
+        return _coerce_numeric(df)
+    except Exception:
+        txt=call_llm([HumanMessage(content=[{"type":"text","text":"Extract all visible text. Plain text only."}, media])],VISION_MODEL)
+        return pd.DataFrame({"text":[txt.strip()]})
+
+
 
 
         
